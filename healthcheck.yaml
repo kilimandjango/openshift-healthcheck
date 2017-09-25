@@ -1,0 +1,174 @@
+# Run from node where Ansible is located. 
+- hosts: masters[0]
+  vars:
+    etcdctlhost: https://XXX:2379
+    subDomain: https://XXX
+  tasks:
+    - name: Check wildcard
+      command: curl -kv {{ subDomain }}
+      run_once: true
+      delegate_to: localhost
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check etcd cluster-health
+      command: etcdctl -C {{ etcdctlhost }}
+--ca-file=/etc/origin/master/master.etcd-ca.crt
+--cert-file=/etc/origin/master/master.etcd-client.crt
+--key-file=/etc/origin/master/master.etcd-client.key cluster-health
+      run_once: true
+      delegate_to: localhost
+      register: shell
+      ignore_errors: True
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check status of default project
+      command: oc status -n default
+      run_once: true
+      delegate_to: localhost
+      register: shell
+      ignore_errors: True
+    - debug: msg={{ shell.stdout  }}
+
+# If the cluster is a multiple master setup check api and controllers.
+- hosts: masters
+  tasks:
+    - name: Check openshift master api
+      command: systemctl status atomic-openshift-master-api
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check openshift master controller
+      command: systemctl status atomic-openshift-master-controllers
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+- hosts: nodes
+  tasks:
+    - name: Check IP forwarding
+      command: sysctl net.ipv4.ip_forward
+
+    - name: Check openvswitch config
+      command: ovs-vsctl list-br
+
+    - name: Check MTU of br0 interface
+      raw: ifconfig br0 | grep mtu | awk '{print$4}'
+      ignore_errors: True
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check MTU in node-config
+      command: grep -rn --include=*.yaml "mtu"
+/etc/origin/node/node-config.yaml
+
+    - name: Check kernel of node
+      command: uname -a
+
+    - name: Check RHEL of node
+      command: cat /etc/redhat-release
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check cpu
+      command: less /proc/cpuinfo
+
+    - name: Check overcommit memory
+      command: sysctl vm.overcommit_memory
+
+    - name: Check vm.panic_on_oom
+      command: sysctl vm.panic_on_oom
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check swapping
+      command: swapon --show
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check SELinux
+      command: getenforce
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check SELinux Config
+      command: cat /etc/sysconfig/selinux
+      register: shell
+
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check DNS on each node
+      command: cat /etc/resolv.conf
+      register: shell
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check DNS on master
+      command: dig @172.22.0.1 kubernetes.default.svc.cluster.local
+      register: shell
+      ignore_errors: True
+
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: Check ansible version on all nodes
+      command: ansible --version
+      register: shell
+
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: Check Docker status
+      raw: systemctl status docker | grep Active
+      register: shell
+      ignore_errors: True
+    - debug: msg={{ shell.stdout  }}
+
+    - name: Check docker version
+      command: docker version
+      register: shell
+    - debug:  msg={{ shell.stdout  }}
+
+# Docker Storage may be configured only on nodes.
+    - name: Check docker storage
+      raw: docker info | egrep -i 'storage|pool|space|filesystem'
+      register: shell
+      ignore_errors: True
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: Check docker storage setup
+      command: cat /etc/sysconfig/docker-storage-setup
+      register: shell
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: Check storage
+      command: df -h
+      register: shell
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: Check insecure registry
+      command: less /etc/sysconfig/docker | grep OPTIONS
+      register: shell
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: Check openvswitch
+      command: systemctl status openvswitch
+      register: shell
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: Check atomic-openshift-node
+      raw: systemctl status atomic-openshift-node | grep Active
+      register: shell
+      ignore_errors: True
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: Check openshift version
+      command: oc version
+      register: shell
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: storage
+      raw: df -h /var/lib/origin/ | tail -1 | awk '{print$5}'
+      register: shell
+    - debug:  msg={{ shell.stdout  }}
+
+    - name: docker storage
+      raw: df -h /var/lib/docker/ | tail -1 | awk '{print$5}'
+      register: shell
+    - debug:  msg={{ shell.stdout  }}
