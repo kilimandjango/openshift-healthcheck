@@ -1,146 +1,211 @@
-# Run from node where Ansible is located. 
-- hosts: masters[0]
+#
+# Usage
+#
+# $ ansible-playbook -i <inventory> health-check.yml
+#
+- hosts: masters
   vars:
-    etcdctlhost: https://XXX:2379
-    subDomain: https://XXX
+    IS_OK: OK
   tasks:
+
+    - name: get subdomain
+      shell: cat /etc/origin/master/master-config.yaml | grep -i subDomain | awk '{print$2}' | tail -1
+      register: subDomain
+    - debug: msg={{ subDomain.stdout }}
+
+    - name: get etcdctlhost
+      shell: cat /etc/origin/master/master-config.yaml | grep -i 2379 | tail -1 | awk '{print$2}'
+      register: etcdctlhost
+    - debug: msg={{ etcdctlhost.stdout }}
+
+    - name: get serviceNetworkCIDR
+      shell: cat /etc/origin/master/master-config.yaml | grep -i serviceNetworkCIDR | awk '{print$2}' | tail -1
+      register: serviceNetworkCIDR
+    - debug: msg={{ serviceNetworkCIDR.stdout }}
+
+    - name: get masterPublicURL
+      shell: cat /etc/origin/master/master-config.yaml | grep -i masterPublicURL | awk '{print$2}' | tail -1
+      register: masterPublicURL
+    - debug: msg={{ masterPublicURL.stdout }}
+
     - name: Check wildcard
-      command: curl -kv {{ subDomain }}
-      run_once: true
-      delegate_to: localhost
+      shell: |
+        dig +short test.{{ subDomain.stdout }}
+        dig +short test.router.default.svc.cluster.local
       register: shell
     - debug: msg={{ shell.stdout  }}
 
-    - name: Check etcd cluster-health
-      command: etcdctl -C {{ etcdctlhost }}
---ca-file=/etc/origin/master/master.etcd-ca.crt
---cert-file=/etc/origin/master/master.etcd-client.crt
---key-file=/etc/origin/master/master.etcd-client.key cluster-health
-      run_once: true
-      delegate_to: localhost
+    - name: Check etcd version
+      shell: etcdctl --v
       register: shell
-      ignore_errors: True
-    - debug: msg={{ shell.stdout  }}
+    - debug: msg={{ shell.stdout }}
+
+    - name: Check etcd cluster-health
+      shell: etcdctl --endpoint {{ etcdctlhost.stdout }} --ca-file=/etc/origin/master/master.etcd-ca.crt --cert-file=/etc/origin/master/master.etcd-client.crt --key-file=/etc/origin/master/master.etcd-client.key cluster-health
+      register: shell
+    - debug: msg={{ shell.stdout }}
 
     - name: Check status of default project
       command: oc status -n default
       run_once: true
       delegate_to: localhost
-      register: shell
+      register: default_status
+      failed_when: "'registry deploys' not in default_status.stdout or 'svc/kubernetes' not in default_status.stdout or 'console deploys' not in default_status.stdout or 'dc/router deploys' not in default_status.stdout"
+
+# Check API endpoints
+    - name: Get bearer token
+      shell: oc whoami -t | awk 'NR==2'
+      register: token
+      delegate_to: localhost
+    - set_fact:
+        parsed_var: "{{ token.stdout }}"
+
+    - name: Check OCP Master API
+      uri:
+        url: "{{ masterPublicURL.stdout }}/healthz"
+        method: GET
+        return_content: yes
+        headers:
+          Authorization: "Bearer {{ parsed_var }}"
+        validate_certs: no
+      register: return_msg
+      failed_when: "'OK' not in return_msg.msg"
+
+    - name: Check registry API
+      uri:
+        url: http://docker-registry.default.svc.cluster.local:5000/healthz
+        method: GET
+        return_content: yes
+      register: return_msg
+      run_once: true
+      failed_when: '"OK" not in return_msg.msg'
+
+    - name: Check openshift version
+      shell: /usr/local/bin/oc version | awk 'NR==1' | cut -dv -f2-
+      register: oc_version
+
+    - name: Check oc client version on Ansible jumphost
+      shell: oc version | awk 'NR==1' | cut -dv -f2-
+      run_once: true
+      delegate_to: localhost
+      register: oc_client_binary_version
       ignore_errors: True
-    - debug: msg={{ shell.stdout  }}
+      failed_when: oc_client_binary_version != oc_version
 
-# If the cluster is a multiple master setup check api and controllers.
-- hosts: masters
-  tasks:
-    - name: Check openshift master api
-      command: systemctl status atomic-openshift-master-api
-      register: shell
-    - debug: msg={{ shell.stdout  }}
+# Check systemd services on masters
 
-    - name: Check openshift master controller
-      command: systemctl status atomic-openshift-master-controllers
-      register: shell
-    - debug: msg={{ shell.stdout  }}
+    - name: Check Master API Service
+      command: systemctl is-active atomic-openshift-master-api
+      register: is_active
+      changed_when: false
+      failed_when: "'unknown' in is_active.stdout"
+
+    - name: Check Master Controllers Service
+      command: systemctl is-active atomic-openshift-master-controllers
+      register: is_active
+      changed_when: false
+      failed_when: "'unknown' in is_active.stdout"
+
 
 - hosts: nodes
   tasks:
     - name: Check IP forwarding
       command: sysctl net.ipv4.ip_forward
 
-    - name: Check openvswitch config
-      command: ovs-vsctl list-br
+#    - name: Get OVS Container 
+#      shell: docker ps | grep openvswitch | awk 'NR==2' | awk '{print$3}' | tail -n 1
+#      shell: docker ps | grep openvswitch | awk 'NR==2'
+#      register: ovsDockerContainer
+#    - debug: msg={{ ovsDockerContainer }}
+#      failed_when: "'openvswitch' not in ovsDockerContainer.stdout"
+
+#    - name: Check openvswitch config
+#      shell: docker exec -t {{ ovsDockerContainer.stdout }} ovs-vsctl list-br
 
     - name: Check MTU of br0 interface
-      raw: ifconfig br0 | grep mtu | awk '{print$4}'
+      shell: ifconfig br0 | grep mtu | awk '{print$4}'
       ignore_errors: True
-      register: shell
-    - debug: msg={{ shell.stdout  }}
+      register: br0_mtu
 
     - name: Check MTU in node-config
-      command: grep -rn --include=*.yaml "mtu"
-/etc/origin/node/node-config.yaml
+      shell: "grep -rn --include=*.yaml \"mtu\" /etc/origin/node/node-config.yaml | awk '{print$3}'"
+      register: node_mtu
+      failed_when: br0_mtu.stdout != node_mtu.stdout
 
     - name: Check kernel of node
       command: uname -a
+      register: kernel
+    - debug: msg={{ kernel.stdout }}
 
     - name: Check RHEL of node
       command: cat /etc/redhat-release
-      register: shell
-    - debug: msg={{ shell.stdout  }}
+      register: redhat_release
+      failed_when: "'7.4' not in redhat_release.stdout"
 
     - name: Check cpu
       command: less /proc/cpuinfo
 
     - name: Check overcommit memory
       command: sysctl vm.overcommit_memory
+      register: vm_overcommit_memory
+      failed_when: "'vm.overcommit_memory = 1' not in vm_overcommit_memory.stdout"
 
     - name: Check vm.panic_on_oom
       command: sysctl vm.panic_on_oom
-      register: shell
-    - debug: msg={{ shell.stdout  }}
+      register: vm_panic_on_oom
+      failed_when: "'vm.panic_on_oom = 0' not in vm_panic_on_oom.stdout"
 
     - name: Check swapping
-      command: swapon --show
-      register: shell
-    - debug: msg={{ shell.stdout  }}
+      shell: free | grep Swap | awk '{print$2}' | tail -1
+      register: swap
+      failed_when: "swap.stdout != '0'"
 
     - name: Check SELinux
       command: getenforce
-      register: shell
-    - debug: msg={{ shell.stdout  }}
+      register: getenforce
+      failed_when: "'Enforcing' not in getenforce.stdout"
 
     - name: Check SELinux Config
       command: cat /etc/sysconfig/selinux
-      register: shell
+      register: selinux_config
+      failed_when: "'SELINUX=enforcing' not in selinux_config.stdout"
 
-    - debug: msg={{ shell.stdout  }}
-
-    - name: Check DNS on each node
+    - name: Display DNS on each node
       command: cat /etc/resolv.conf
       register: shell
     - debug: msg={{ shell.stdout  }}
 
-    - name: Check DNS on master
-      command: dig @172.22.0.1 kubernetes.default.svc.cluster.local
-      register: shell
-      ignore_errors: True
-
-    - debug:  msg={{ shell.stdout  }}
+#    - name: Check DNS on node
+#      command: dig @{{ serviceNetworkCIDR.stdout }} kubernetes.default.svc.cluster.local
+#      register: shell
+#      ignore_errors: True
 
     - name: Check ansible version on all nodes
       command: ansible --version
-      register: shell
-
-    - debug:  msg={{ shell.stdout  }}
-
-    - name: Check Docker status
-      raw: systemctl status docker | grep Active
-      register: shell
-      ignore_errors: True
-    - debug: msg={{ shell.stdout  }}
+      register: ansible_version
+    - debug:  msg={{ ansible_version  }}
 
     - name: Check docker version
       command: docker version
-      register: shell
-    - debug:  msg={{ shell.stdout  }}
+      register: docker_version
+      failed_when: "'1.12.6' not in docker_version.stdout"
 
 # Docker Storage may be configured only on nodes.
     - name: Check docker storage
-      raw: docker info | egrep -i 'storage|pool|space|filesystem'
-      register: shell
+      shell: docker info | egrep -i 'storage|pool|space|filesystem'
+      register: docker_info
       ignore_errors: True
-    - debug:  msg={{ shell.stdout  }}
+      failed_when: "'devicemapper' not in docker_info.stdout"
 
     - name: Check docker storage setup
       command: cat /etc/sysconfig/docker-storage-setup
-      register: shell
-    - debug:  msg={{ shell.stdout  }}
+      register: docker_storage_setup
+      failed_when: "'DEVS=/dev/sdb' not in docker_storage_setup.stdout"
 
-    - name: Check storage
-      command: df -h
-      register: shell
-    - debug:  msg={{ shell.stdout  }}
+#    - name: Check storage
+#      shell: echo $(echo \"$(docker info 2>/dev/null | awk '/Data Space Available/ {print $4}') / $(docker info 2>/dev/null | awk '/Data Space Total/ {print $4}')\" | bc -l) '>' 0.3 | bc -l
+#      register: shell
+#    - debug:  msg={{ shell.stdout  }}
 
     - name: Check insecure registry
       command: less /etc/sysconfig/docker | grep OPTIONS
@@ -148,27 +213,24 @@
     - debug:  msg={{ shell.stdout  }}
 
     - name: Check openvswitch
-      command: systemctl status openvswitch
-      register: shell
-    - debug:  msg={{ shell.stdout  }}
-
-    - name: Check atomic-openshift-node
-      raw: systemctl status atomic-openshift-node | grep Active
-      register: shell
-      ignore_errors: True
-    - debug:  msg={{ shell.stdout  }}
-
-    - name: Check openshift version
-      command: oc version
-      register: shell
-    - debug:  msg={{ shell.stdout  }}
+      command: systemctl is-active openvswitch
+      register: is_active
+      changed_when: false
+      failed_when: "'unknown' in is_active.stdout"
 
     - name: storage
-      raw: df -h /var/lib/origin/ | tail -1 | awk '{print$5}'
+      shell: df -h /var/lib/origin/ | tail -1 | awk '{print$5}'
       register: shell
     - debug:  msg={{ shell.stdout  }}
 
     - name: docker storage
-      raw: df -h /var/lib/docker/ | tail -1 | awk '{print$5}'
+      shell: df -h /var/lib/docker/ | tail -1 | awk '{print$5}'
       register: shell
-    - debug:  msg={{ shell.stdout  }}
+    - debug:  msg={{ shell.stdout }}
+
+# Check systemd services on nodes
+    - name: Check Node Service
+      command: systemctl is-active atomic-openshift-node
+      register: is_active
+      changed_when: false
+      failed_when: "'unknown' in is_active.stdout"
