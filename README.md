@@ -7,9 +7,6 @@ How to use the playbook
 ------------------
  - Check where your inventory file is located:
  `$ cat /etc/ansible/hosts`
- - Check which host groups are setup in your inventory
- - Adjust the following variables according to your cluster:
-      - etcdctlhost: https://XXX:2379
-      - subDomain: https://XXX
+ 
  - Run the playbook:
  `$ ansible-playbook healtchcheck.yaml`
