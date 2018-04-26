@@ -5,8 +5,8 @@
   
 How to use the playbook
 ------------------
- - Check where your inventory file is located:
+ - Check where your inventory file is located, e.g.:
  `$ cat /etc/ansible/hosts`
  
  - Run the playbook:
- `$ ansible-playbook healtchcheck.yaml`
+ `$ ansible-playbook -i /etc/ansible/hosts ocp-healtchcheck.yaml`
