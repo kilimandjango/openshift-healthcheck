@@ -1,46 +1,112 @@
-# Run from node where Ansible is located. 
+# Run from node where Ansible is located.
 #
 # Usage
 #
-# $ ansible-playbook -i <INVENTORY> ocp-healthcheck.yml 
+# $ ansible-playbook -i <INVENTORY> ocp-healthcheck.yml
 #
 #
-- hosts: masters
+- hosts: localhost
   gather_facts: no
   vars:
     IS_OK: OK
+
+# Ask credentials to get a token at the api
+  vars_prompt:
+    - name: "oscp_user"
+      prompt: Enter your username
+
+    - name: "oscp_password"
+      prompt: Enter your password"
+      private: yes
+
+  pre_tasks:
+    - name: gather etcd nodes
+      set_fact:
+        etcd_nodes: "{{ groups['etcd'] | list }}"
+
+    - name: get length
+      set_fact:
+        membercount: "{{ etcd_nodes | length }}"
+
+    - name: get master api
+      shell: oc whoami --show-server
+      register: masterapi
+      changed_when: false
+    - set_fact:
+        master_api: "{{ masterapi.stdout }}"
+
+    - name: Set master_fqdn
+      set_fact:
+        master_fqdn: "{{ groups['masters'][0] }}"
+
+    - name: Set master-ip
+      local_action: shell nslookup {{ master_fqdn }} | grep Address | awk '{if(NR>1)print$2}'
+      register: nslookup_response
+      changed_when: false
+    - set_fact:
+        master_ip: "{{ nslookup_response.stdout }}"
+
   tasks:
+# Ansible version must be 2.4.x
+    - assert:
+        that: ansible_version.minor == 4
+
+# Determine OCP Token for current user
+    - name: get token for user
+      uri:
+        url: "{{ master_api }}/oauth/authorize?response_type=token&client_id=openshift-challenging-client"
+        force_basic_auth: yes
+        user: "{{ oscp_user }}"
+        password: "{{ oscp_password }}"
+        headers:
+          X-Csrf-Token: 1
+        return_content: yes
+        validate_certs: no
+      register: tokenresponse
+
+    - name: extract token
+      local_action: shell echo {{ tokenresponse }} | grep -oP "access_token=\K[^&]*"
+      register: extractedtoken
+      changed_when: false
+
+    - set_fact:
+        ocp_token: "{{ extractedtoken.stdout }}"
+
+# Break if not logged in
     - name: Get username
-      local_action: command oc whoami
+      shell: command oc whoami
       register: userName
       run_once: true
       failed_when: >
         "system:anonymous" in userName.stdout
       changed_when: false
 
+# Check ports on master nodes
+    - name: check if ports are open on masters
+      wait_for:
+        port: "{{ item }}"
+        delay: 5
+        timeout: 10
+        msg: "Timeout waiting for {{ item }} to respond"
+      register: port_check
+      ignore_errors: true
+      with_items:
+        - 53
+        - 22
+        - 8443
+
+# Check master config stuff
     - name: get subdomain
       shell: cat /etc/origin/master/master-config.yaml | grep -i subDomain | awk '{print$2}' | tail -1
       register: subDomain
       changed_when: false
     - debug: msg={{ subDomain.stdout }}
 
-    - name: get etcdctlhost
-      shell: cat /etc/origin/master/master-config.yaml | grep -i 2379 | tail -1 | awk '{print$2}'
-      register: etcdctlhost
-      changed_when: false
-    - debug: msg={{ etcdctlhost.stdout }}
-
     - name: get serviceNetworkCIDR
       shell: cat /etc/origin/master/master-config.yaml | grep -i serviceNetworkCIDR | awk '{print$2}' | tail -1
       register: serviceNetworkCIDR
       changed_when: false
     - debug: msg={{ serviceNetworkCIDR.stdout }}
-
-    - name: get masterPublicURL
-      shell: cat /etc/origin/master/master-config.yaml | grep -i masterPublicURL | awk '{print$2}' | tail -1
-      register: masterPublicURL
-      changed_when: false
-    - debug: msg={{ masterPublicURL.stdout }}
 
     - name: Check wildcard
       shell: |
@@ -50,18 +116,48 @@
       changed_when: false
     - debug: msg={{ shell.stdout  }}
 
-    - name: Check etcd version
-      shell: etcdctl --v
-      register: shell
+    - name: check nameserver
+      shell: cat /etc/resolv.conf  | grep -v '^#' | grep nameserver | awk '{print $2}'
+      register: nameserver
       changed_when: false
-    - debug: msg={{ shell.stdout }}
 
-    - name: Check etcd cluster-health
-      shell: etcdctl --endpoint {{ etcdctlhost.stdout }} --ca-file=/etc/origin/master/master.etcd-ca.crt --cert-file=/etc/origin/master/master.etcd-client.crt --key-file=/etc/origin/master/master.etcd-client.key cluster-health
-      register: shell
+    - name: check dns
+      shell: dig {{ item }} @{{ nameserver.stdout }} +short
+      register: dnscheck
+      with_items: "{{ groups['masters'] }}"
       changed_when: false
-    - debug: msg={{ shell.stdout }}
 
+    - name: Fail if result is empty
+      fail:
+        msg: "DNS answer ({{ item.stdout }}) is empty"
+      when: '"172" not in item.stdout'
+      with_items: "{{ dnscheck.results }}"
+      changed_when: false
+
+
+# Check etcd health
+    - name: determine number of etcd cluster members openshift recognizes
+      local_action: shell oc get cs | grep etcd | awk '{print $1}'
+      register: oc_output
+      changed_when: false
+    - set_fact:
+        etcd_members: "{{ oc_output.stdout.split('\n')|list }}"
+
+    - name: Check etcd member health
+      command: >
+        curl -kv
+        -H "Authorization: Bearer {{ ocp_token }}"
+        {{ master_api }}/api/v1/componentstatuses/{{ item }}
+      with_items:
+        - "{{ etcd_members }}"
+      register: etcdcheck
+      failed_when:
+        - '"Healthy" not in etcdcheck.stdout'
+      changed_when: false
+      args:
+        warn: no
+
+# Check default project status
     - name: Check status of default project
       command: oc status -n default
       run_once: true
@@ -71,23 +167,15 @@
       failed_when: "'registry deploys' not in default_status.stdout or 'svc/kubernetes' not in default_status.stdout or 'console deploys' not in default_status.stdout or 'dc/router deploys' not in default_status.stdout"
 
 # Check API endpoints
-    - name: Get bearer token
-      shell: oc whoami -t | awk 'NR==2'
-      register: token
-      delegate_to: localhost
-      changed_when: false
-    - set_fact:
-        parsed_var: "{{ token.stdout }}"
-
     - name: Check OCP Master API
       uri:
-        url: "{{ masterPublicURL.stdout }}/healthz"
+        url: "{{ master_api }}/healthz"
         method: GET
         return_content: yes
         headers:
-          Authorization: "Bearer {{ parsed_var }}"
+          Authorization: "Bearer {{ ocp_token }}"
         validate_certs: no
-      register: return_msg 
+      register: return_msg
       changed_when: false
       failed_when: "'OK' not in return_msg.msg"
 
@@ -101,6 +189,19 @@
       changed_when: false
       failed_when: '"OK" not in return_msg.msg'
 
+# Check Docker registry
+    - name: Check service address of registry
+      shell: dig +short docker-registry.default.svc.cluster.local
+      register: digoutput
+      changed_when: false
+
+    - name: Check if skydns is working correctly
+      shell: oc get svc/docker-registry -n default --no-headers | awk '{print$2}'
+      register: skydnsoutput
+      changed_when: false
+      failed_when: digoutput.stdout != skydnsoutput.stdout
+
+# Check OCP version and client
     - name: Check openshift version
       shell: /usr/local/bin/oc version | awk 'NR==1' | cut -dv -f2-
       register: oc_version
@@ -116,7 +217,6 @@
       failed_when: oc_client_binary_version != oc_version
 
 # Check systemd services on masters
-
     - name: Check Master API Service
       command: systemctl is-active atomic-openshift-master-api
       register: is_active
@@ -133,18 +233,29 @@
 - hosts: nodes
   gather_facts: no
   tasks:
+
+    - name: check if ports are open on nodes
+      wait_for:
+        port: "{{ item }}"
+        delay: 5
+        timeout: 10
+        msg: "Timeout waiting for {{ item }} to respond"
+      register: port_check
+      ignore_errors: true
+      with_items:
+        - 53
+        - 22
+        - 10250
+
     - name: Check IP forwarding
       command: sysctl net.ipv4.ip_forward
+      changed_when: false
 
-#    - name: Get OVS Container
-#      shell: docker ps | grep openvswitch | awk 'NR==2' | awk '{print$3}' | tail -n 1
-#      shell: docker ps | grep openvswitch | awk 'NR==2'
-#      register: ovsDockerContainer
-#    - debug: msg={{ ovsDockerContainer }}
-#      failed_when: "'openvswitch' not in ovsDockerContainer.stdout"
-
-#    - name: Check openvswitch config
-#      shell: docker exec -t {{ ovsDockerContainer.stdout }} ovs-vsctl list-br
+    - name: Check openvswitch config
+      command: ovs-vsctl list-br
+      register: ovsoutput
+      changed_when: false
+      failed_when: '"br0" not in ovsoutput.stdout'
 
     - name: Check MTU of br0 interface
       shell: ifconfig br0 | grep mtu | awk '{print$4}'
@@ -156,7 +267,7 @@
       shell: "grep -rn --include=*.yaml \"mtu\" /etc/origin/node/node-config.yaml | awk '{print$3}'"
       register: node_mtu
       changed_when: false
-      failed_when: br0_mtu.stdout != node_mtu.stdout 
+      failed_when: br0_mtu.stdout < node_mtu.stdout
 
     - name: Check kernel of node
       command: uname -a
@@ -168,7 +279,7 @@
       command: cat /etc/redhat-release
       register: redhat_release
       changed_when: false
-      failed_when: "'7.4' not in redhat_release.stdout"
+      failed_when: "'7.5' not in redhat_release.stdout"
 
     - name: Check cpu
       command: less /proc/cpuinfo
@@ -215,62 +326,40 @@
 #      register: shell
 #      ignore_errors: True
 
-    - name: Check ansible version on all nodes
-      command: ansible --version
-      register: ansible_version
-      changed_when: false
-    - debug:  msg={{ ansible_version  }}
 
+# Check Docker state
     - name: Check docker version
       command: docker version
       register: docker_version
       changed_when: false
-      failed_when: "'1.12.6' not in docker_version.stdout" 
+      failed_when: "'1.12.6' not in docker_version.stdout"
 
 # Docker Storage may be configured only on nodes.
-    - name: Check docker storage
+    - name: Check docker storage driver
       shell: docker info | egrep -i 'storage|pool|space|filesystem'
-      register: docker_info 
+      register: docker_info
       ignore_errors: True
       changed_when: false
       failed_when: "'devicemapper' not in docker_info.stdout"
-#    - debug:  msg={{ shell.stdout  }}
 
     - name: Check docker storage setup
       command: cat /etc/sysconfig/docker-storage-setup
       register: docker_storage_setup
       changed_when: false
-      failed_when: "'DEVS=/dev/sdb' not in docker_storage_setup.stdout" 
+      failed_when: "'DEVS=/dev/sdb' not in docker_storage_setup.stdout"
 
-#    - name: Check storage
-#      shell: echo $(echo \"$(docker info 2>/dev/null | awk '/Data Space Available/ {print $4}') / $(docker info 2>/dev/null | awk '/Data Space Total/ {print $4}')\" | bc -l) '>' 0.3 | bc -l
-#      register: shell
-#    - debug:  msg={{ shell.stdout  }}
-   
-
-    - name: Check insecure registry
-      command: less /etc/sysconfig/docker | grep OPTIONS
-      register: shell
+    - name: Check docker storage
+      shell: lvs | grep docker-pool | awk '{print$5}'
+      register: dockerstorage
       changed_when: false
-    - debug:  msg={{ shell.stdout  }}
-
-    - name: Check openvswitch
-      command: systemctl is-active openvswitch
-      register: is_active
-      changed_when: false
-      failed_when: "'unknown' in is_active.stdout"
+    - debug:
+        msg: "{{ dockerstorage.stdout }}"
 
     - name: storage
       shell: df -h /var/lib/origin/ | tail -1 | awk '{print$5}'
       register: shell
       changed_when: false
     - debug:  msg={{ shell.stdout  }}
-
-    - name: docker storage
-      shell: df -h /var/lib/docker/ | tail -1 | awk '{print$5}'
-      register: shell
-      changed_when: false
-    - debug:  msg={{ shell.stdout }}
 
 # Check systemd services on nodes
     - name: Check Node Service
@@ -279,6 +368,8 @@
       changed_when: false
       failed_when: "'active' != is_active.stdout"
 
-
-
-
+    - name: Check openvswitch
+      command: systemctl is-active openvswitch
+      register: is_active
+      changed_when: false
+      failed_when: "'unknown' in is_active.stdout"
